@@ -41,6 +41,14 @@ backend/data/snapshots/*
 !backend/data/snapshots/.gitkeep
 !backend/data/.gitkeep
 
+# ML assets and training artifacts
+datasets/
+runs/
+weights/
+*.pt
+*.onnx
+*.engine
+
 # Environment & OS files
 .env
 .env.local

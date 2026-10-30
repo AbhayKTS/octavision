@@ -2,7 +2,13 @@ from flask import Flask, jsonify, request, send_from_directory
 from flask_cors import CORS
 from pathlib import Path
 from datetime import datetime, date
+import base64
+import threading
 import sqlite3, uuid
+
+import cv2
+import numpy as np
+from ultralytics import YOLO
 
 ROOT = Path(__file__).resolve().parent
 DATA = ROOT / "data"
@@ -50,6 +56,31 @@ def err(msg, code=400): return jsonify({"error":msg}),code
 # Only a normalized "no_helmet" prediction creates a violation and alert.
 HELMET_LABELS = {"helmet", "with_helmet", "helmet_detected", "hardhat"}
 NO_HELMET_LABELS = {"no_helmet", "no-helmet", "without_helmet", "helmet_missing", "no_hardhat"}
+VEST_LABELS = {"vest", "safety_vest", "with_vest"}
+NO_VEST_LABELS = {"no_vest", "no-vest", "without_vest", "vest_missing"}
+INFERENCE_LABEL_MAP = {
+    "helmet": "helmet",
+    "hardhat": "helmet",
+    "with_helmet": "helmet",
+    "helmet_detected": "helmet",
+    "no_helmet": "no_helmet",
+    "no-helmet": "no_helmet",
+    "without_helmet": "no_helmet",
+    "helmet_missing": "no_helmet",
+    "vest": "vest",
+    "safety_vest": "vest",
+    "with_vest": "vest",
+    "no_vest": "no_vest",
+    "no-vest": "no_vest",
+    "without_vest": "no_vest",
+    "vest_missing": "no_vest",
+}
+
+MODEL_RUNTIME = {
+    "weights_path": None,
+    "model": None,
+    "lock": threading.Lock(),
+}
 
 def normalize_label(value):
     label = str(value or "").strip().lower().replace(" ", "_")
@@ -59,8 +90,160 @@ def normalize_label(value):
         return "helmet_missing"
     return None
 
+
+def _connected_construction_weights():
+    with dbconn() as d:
+        row = d.execute(
+            "SELECT weights_path FROM model_registry WHERE site_type='construction' ORDER BY id LIMIT 1"
+        ).fetchone()
+    if row:
+        configured = Path(str(row["weights_path"] or "")).expanduser()
+        if configured and configured.is_file():
+            return configured
+
+    candidates = [
+        ROOT.parent / "runs" / "detect" / "runs" / "octavision" / "construction_v1" / "weights" / "best.pt",
+        ROOT.parent / "weights" / "yolo26n.pt",
+        ROOT.parent / "yolo26n.pt",
+    ]
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def _get_model():
+    weights_path = _connected_construction_weights()
+    if not weights_path:
+        return None, None, "No model weights found. Configure construction model weights first."
+
+    resolved = str(weights_path.resolve())
+    with MODEL_RUNTIME["lock"]:
+        if MODEL_RUNTIME["model"] is None or MODEL_RUNTIME["weights_path"] != resolved:
+            MODEL_RUNTIME["model"] = YOLO(resolved)
+            MODEL_RUNTIME["weights_path"] = resolved
+    return MODEL_RUNTIME["model"], resolved, None
+
+
+def _decode_image_from_request():
+    if "file" in request.files:
+        uploaded = request.files["file"]
+        raw = uploaded.read()
+        if not raw:
+            return None, "Uploaded file is empty."
+        array = np.frombuffer(raw, dtype=np.uint8)
+        image = cv2.imdecode(array, cv2.IMREAD_COLOR)
+        if image is None:
+            return None, "Unable to decode uploaded image."
+        return image, None
+
+    payload = request.get_json(silent=True) or {}
+    image_data = str(payload.get("image_data") or "").strip()
+    if not image_data:
+        return None, "Send multipart file or JSON image_data (base64 data URL)."
+
+    try:
+        base64_part = image_data.split(",", 1)[1] if "," in image_data else image_data
+        binary = base64.b64decode(base64_part)
+        array = np.frombuffer(binary, dtype=np.uint8)
+        image = cv2.imdecode(array, cv2.IMREAD_COLOR)
+    except Exception:
+        return None, "Invalid base64 image_data."
+
+    if image is None:
+        return None, "Unable to decode image_data."
+    return image, None
+
+
+def _normalize_inference_label(raw_label):
+    key = str(raw_label or "").strip().lower().replace(" ", "_")
+    return INFERENCE_LABEL_MAP.get(key, key)
+
+
+def _run_inference(image, conf=0.25, iou=0.45):
+    model, weights_path, model_error = _get_model()
+    if model_error:
+        return None, model_error
+
+    result = model.predict(source=image, conf=conf, iou=iou, verbose=False, max_det=120)[0]
+    boxes = result.boxes
+    names = result.names
+    detections = []
+    counts = {"helmet": 0, "vest": 0, "no_helmet": 0, "no_vest": 0, "other": 0}
+
+    if boxes is not None:
+        for box in boxes:
+            x1, y1, x2, y2 = [int(v) for v in box.xyxy[0].tolist()]
+            class_id = int(box.cls.item())
+            raw_name = str(names[class_id])
+            normalized = _normalize_inference_label(raw_name)
+            score = float(box.conf.item())
+
+            if normalized in counts:
+                counts[normalized] += 1
+            else:
+                counts["other"] += 1
+
+            detections.append(
+                {
+                    "class_name": raw_name,
+                    "normalized_label": normalized,
+                    "confidence": round(score, 6),
+                    "bbox": {"x1": x1, "y1": y1, "x2": x2, "y2": y2},
+                    "is_violation": normalized in {"no_helmet", "no_vest"},
+                }
+            )
+
+    return {
+        "weights_path": weights_path,
+        "image": {"width": int(result.orig_shape[1]), "height": int(result.orig_shape[0])},
+        "counts": counts,
+        "has_violation": counts["no_helmet"] > 0 or counts["no_vest"] > 0,
+        "detections": detections,
+    }, None
+
 @app.get("/api/health")
 def health(): return jsonify({"ok":True,"service":"OctaVision API","time":now()})
+
+
+@app.get("/api/model/status")
+def model_status():
+    model, path, model_error = _get_model()
+    if model_error:
+        return jsonify({"ready": False, "error": model_error}), 200
+    return jsonify({
+        "ready": model is not None,
+        "weights_path": path,
+        "supported_labels": ["helmet", "vest", "no_helmet", "no_vest"],
+    })
+
+
+@app.post("/api/model/infer")
+def model_infer():
+    image, decode_error = _decode_image_from_request()
+    if decode_error:
+        return err(decode_error)
+
+    payload = request.get_json(silent=True) or {}
+    if request.form:
+        payload = request.form.to_dict()
+
+    try:
+        conf = float(payload.get("confidence", 0.25))
+        iou = float(payload.get("iou", 0.45))
+    except (ValueError, TypeError):
+        return err("confidence and iou must be numbers.")
+
+    if not 0 <= conf <= 1:
+        return err("confidence must be between 0 and 1.")
+    if not 0 <= iou <= 1:
+        return err("iou must be between 0 and 1.")
+
+    inference, infer_error = _run_inference(image, conf=conf, iou=iou)
+    if infer_error:
+        return err(infer_error, 503)
+
+    return jsonify({"ok": True, **inference})
 
 @app.get("/api/dashboard")
 def dashboard():
