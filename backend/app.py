@@ -8,7 +8,8 @@ import sqlite3, uuid
 
 import cv2
 import numpy as np
-from ultralytics import YOLO
+# Ultralytics is lazy-loaded on first inference request
+from violation_service import ViolationManagementService
 
 ROOT = Path(__file__).resolve().parent
 DATA = ROOT / "data"
@@ -16,7 +17,10 @@ SNAPS = DATA / "snapshots"
 DB_PATH = DATA / "octavision.db"
 SNAPS.mkdir(parents=True, exist_ok=True)
 app = Flask(__name__)
-CORS(app, resources={r"/api/*": {"origins": ["http://localhost:5173", "http://127.0.0.1:5173"]}})
+CORS(app, resources={r"/api/*": {"origins": "*"}})
+
+# Modular Violation Management Service
+violation_service = ViolationManagementService(DB_PATH, SNAPS, cooldown_secs=20)
 
 def now():
     return datetime.now().astimezone().isoformat(timespec="seconds")
@@ -28,6 +32,7 @@ def dbconn():
     return c
 
 def init_db():
+    violation_service.db_path = DB_PATH
     with dbconn() as d:
         d.executescript("""
         CREATE TABLE IF NOT EXISTS sites(id INTEGER PRIMARY KEY, name TEXT NOT NULL, site_type TEXT NOT NULL, location TEXT DEFAULT '', created_at TEXT NOT NULL);
@@ -74,12 +79,40 @@ INFERENCE_LABEL_MAP = {
     "no-vest": "no_vest",
     "without_vest": "no_vest",
     "vest_missing": "no_vest",
+    "person": "person",
+    "human": "person",
+    "worker": "person",
 }
 
 MODEL_RUNTIME = {
-    "weights_path": None,
-    "model": None,
+    "instances": {},
     "lock": threading.Lock(),
+}
+
+# In-memory cooldown store: {camera_id: {ppe_type: last_event_unix_time}}
+# Prevents duplicate violations for the same camera+PPE within 30 seconds.
+VIOLATION_COOLDOWNS: dict = {}
+VIOLATION_COOLDOWN_SECS = 30
+COOLDOWN_LOCK = threading.Lock()
+
+SUPPORTED_SITE_TYPES = {"construction", "chemical", "road", "mining", "general"}
+
+SITE_MODEL_CANDIDATES = {
+    "construction": [
+        ROOT.parent / "runs" / "detect" / "runs" / "octavision" / "construction_v1" / "weights" / "best.pt",
+    ],
+    "chemical": [
+        ROOT.parent / "runs" / "detect" / "runs" / "octavision" / "chemical_v1" / "weights" / "best.pt",
+    ],
+    "road": [
+        ROOT.parent / "runs" / "detect" / "runs" / "octavision" / "road_v1" / "weights" / "best.pt",
+    ],
+    "mining": [
+        ROOT.parent / "runs" / "detect" / "runs" / "octavision" / "mining_v1" / "weights" / "best.pt",
+    ],
+    "general": [
+        ROOT.parent / "runs" / "detect" / "runs" / "octavision" / "general_v1" / "weights" / "best.pt",
+    ],
 }
 
 def normalize_label(value):
@@ -91,18 +124,23 @@ def normalize_label(value):
     return None
 
 
-def _connected_construction_weights():
+def _resolve_site_type(value):
+    site_type = str(value or "construction").strip().lower()
+    return site_type if site_type in SUPPORTED_SITE_TYPES else None
+
+
+def _connected_weights(site_type):
     with dbconn() as d:
         row = d.execute(
-            "SELECT weights_path FROM model_registry WHERE site_type='construction' ORDER BY id LIMIT 1"
+            "SELECT weights_path FROM model_registry WHERE site_type=? ORDER BY id LIMIT 1",
+            (site_type,),
         ).fetchone()
     if row:
         configured = Path(str(row["weights_path"] or "")).expanduser()
         if configured and configured.is_file():
             return configured
 
-    candidates = [
-        ROOT.parent / "runs" / "detect" / "runs" / "octavision" / "construction_v1" / "weights" / "best.pt",
+    candidates = SITE_MODEL_CANDIDATES.get(site_type, []) + [
         ROOT.parent / "weights" / "yolo26n.pt",
         ROOT.parent / "yolo26n.pt",
     ]
@@ -112,17 +150,20 @@ def _connected_construction_weights():
     return None
 
 
-def _get_model():
-    weights_path = _connected_construction_weights()
+def _get_model(site_type="construction"):
+    weights_path = _connected_weights(site_type)
     if not weights_path:
-        return None, None, "No model weights found. Configure construction model weights first."
+        return None, None, f"No model weights found for site_type='{site_type}'. Configure registry weights first."
 
     resolved = str(weights_path.resolve())
     with MODEL_RUNTIME["lock"]:
-        if MODEL_RUNTIME["model"] is None or MODEL_RUNTIME["weights_path"] != resolved:
-            MODEL_RUNTIME["model"] = YOLO(resolved)
-            MODEL_RUNTIME["weights_path"] = resolved
-    return MODEL_RUNTIME["model"], resolved, None
+        key = f"{site_type}|{resolved}"
+        if key not in MODEL_RUNTIME["instances"]:
+            MODEL_RUNTIME["instances"] = {k: v for k, v in MODEL_RUNTIME["instances"].items() if not k.startswith(f"{site_type}|")}
+            from ultralytics import YOLO
+            MODEL_RUNTIME["instances"][key] = YOLO(resolved)
+        model = MODEL_RUNTIME["instances"][key]
+    return model, resolved, None
 
 
 def _decode_image_from_request():
@@ -160,17 +201,25 @@ def _normalize_inference_label(raw_label):
     return INFERENCE_LABEL_MAP.get(key, key)
 
 
-def _run_inference(image, conf=0.25, iou=0.45):
-    model, weights_path, model_error = _get_model()
+def _run_inference(image, site_type="construction", conf=0.35, iou=0.45):
+    model, weights_path, model_error = _get_model(site_type=site_type)
     if model_error:
         return None, model_error
 
-    result = model.predict(source=image, conf=conf, iou=iou, verbose=False, max_det=120)[0]
+    # Minimum threshold 0.32 to filter out noisy textures & spurious detections
+    effective_conf = max(float(conf or 0.35), 0.32)
+    result = model.predict(source=image, conf=effective_conf, iou=iou, verbose=False, max_det=60)[0]
     boxes = result.boxes
     names = result.names
-    detections = []
-    counts = {"helmet": 0, "vest": 0, "no_helmet": 0, "no_vest": 0, "other": 0}
 
+    raw_persons = []
+    raw_helmets = []
+    raw_vests = []
+    raw_no_helmets = []
+    raw_no_vests = []
+
+    # 1. Filter ONLY the core classes: person, helmet, vest
+    ALLOWED_LABELS = {"person", "helmet", "vest", "no_helmet", "no_vest"}
     if boxes is not None:
         for box in boxes:
             x1, y1, x2, y2 = [int(v) for v in box.xyxy[0].tolist()]
@@ -179,26 +228,225 @@ def _run_inference(image, conf=0.25, iou=0.45):
             normalized = _normalize_inference_label(raw_name)
             score = float(box.conf.item())
 
-            if normalized in counts:
-                counts[normalized] += 1
-            else:
-                counts["other"] += 1
+            if normalized not in ALLOWED_LABELS:
+                continue
 
-            detections.append(
-                {
-                    "class_name": raw_name,
-                    "normalized_label": normalized,
-                    "confidence": round(score, 6),
-                    "bbox": {"x1": x1, "y1": y1, "x2": x2, "y2": y2},
-                    "is_violation": normalized in {"no_helmet", "no_vest"},
-                }
-            )
+            item = {
+                "class_name": raw_name,
+                "normalized_label": normalized,
+                "confidence": round(score, 4),
+                "bbox": {"x1": x1, "y1": y1, "x2": x2, "y2": y2},
+            }
+
+            if normalized == "person":
+                raw_persons.append(item)
+            elif normalized == "helmet":
+                raw_helmets.append(item)
+            elif normalized == "vest":
+                raw_vests.append(item)
+            elif normalized == "no_helmet":
+                raw_no_helmets.append(item)
+            elif normalized == "no_vest":
+                raw_no_vests.append(item)
+
+    detections = []
+    counts = {"helmet": 0, "vest": 0, "no_helmet": 0, "no_vest": 0, "person": len(raw_persons), "full_ppe": 0}
+
+    def center(b):
+        return (b["x1"] + b["x2"]) / 2, (b["y1"] + b["y2"]) / 2
+
+    # 2. Person-Centric Wearing Association
+    if raw_persons:
+        used_helmets = set()
+        used_vests = set()
+
+        for idx, p in enumerate(raw_persons):
+            pb = p["bbox"]
+            pw = pb["x2"] - pb["x1"]
+            ph = pb["y2"] - pb["y1"]
+
+            # Head Region: top 38% of the person box
+            hx1, hx2 = pb["x1"] - 0.20 * pw, pb["x2"] + 0.20 * pw
+            hy1, hy2 = pb["y1"] - 0.25 * ph, pb["y1"] + 0.38 * ph
+
+            # Torso Region: 18% to 75% of the person's height
+            tx1, tx2 = pb["x1"] - 0.20 * pw, pb["x2"] + 0.20 * pw
+            ty1, ty2 = pb["y1"] + 0.18 * ph, pb["y1"] + 0.75 * ph
+
+            # Check for worn helmet on head
+            person_helmets = []
+            for h_idx, h in enumerate(raw_helmets):
+                cx, cy = center(h["bbox"])
+                if hx1 <= cx <= hx2 and hy1 <= cy <= hy2:
+                    person_helmets.append(h)
+                    used_helmets.add(h_idx)
+
+            has_helmet_worn = len(person_helmets) > 0
+
+            # Direct no_helmet box on head overrides
+            for nh in raw_no_helmets:
+                cx, cy = center(nh["bbox"])
+                if hx1 <= cx <= hx2 and hy1 <= cy <= hy2:
+                    has_helmet_worn = False
+                    break
+
+            # Check for worn vest on torso
+            person_vests = []
+            for v_idx, v in enumerate(raw_vests):
+                cx, cy = center(v["bbox"])
+                if tx1 <= cx <= tx2 and ty1 <= cy <= ty2:
+                    person_vests.append(v)
+                    used_vests.add(v_idx)
+
+            has_vest_worn = len(person_vests) > 0
+
+            # Direct no_vest box on torso overrides
+            for nv in raw_no_vests:
+                cx, cy = center(nv["bbox"])
+                if tx1 <= cx <= tx2 and ty1 <= cy <= ty2:
+                    has_vest_worn = False
+                    break
+
+            # Evaluate person compliance
+            p_conf = p["confidence"]
+            if not has_helmet_worn and not has_vest_worn:
+                # Both missing -> PPE Kit Violation
+                counts["no_helmet"] += 1
+                counts["no_vest"] += 1
+                counts["full_ppe"] += 1
+                detections.append({
+                    "class_name": "person",
+                    "normalized_label": "no_helmet_and_vest",
+                    "violation_type": "full_ppe",
+                    "confidence": p_conf,
+                    "bbox": pb,
+                    "is_violation": True,
+                    "label_text": "PPE KIT VIOLATION (NO HELMET + NO VEST)",
+                })
+            elif not has_helmet_worn and has_vest_worn:
+                # Has vest, but missing helmet -> Helmet Violation
+                counts["no_helmet"] += 1
+                counts["vest"] += 1
+                detections.append({
+                    "class_name": "person",
+                    "normalized_label": "no_helmet",
+                    "violation_type": "helmet",
+                    "confidence": p_conf,
+                    "bbox": pb,
+                    "is_violation": True,
+                    "label_text": "HELMET NOT DETECTED",
+                })
+            elif has_helmet_worn and not has_vest_worn:
+                # Has helmet, but missing vest -> Vest Violation
+                counts["no_vest"] += 1
+                counts["helmet"] += 1
+                detections.append({
+                    "class_name": "person",
+                    "normalized_label": "no_vest",
+                    "violation_type": "vest",
+                    "confidence": p_conf,
+                    "bbox": pb,
+                    "is_violation": True,
+                    "label_text": "SAFETY VEST MISSING",
+                })
+            else:
+                # Both worn -> Worker fully compliant
+                counts["helmet"] += 1
+                counts["vest"] += 1
+                detections.append({
+                    "class_name": "person",
+                    "normalized_label": "person",
+                    "confidence": p_conf,
+                    "bbox": pb,
+                    "is_violation": False,
+                    "label_text": "WORKER COMPLIANT",
+                })
+
+            # Add person's worn gear boxes
+            for h in person_helmets:
+                detections.append({
+                    "class_name": "helmet",
+                    "normalized_label": "helmet",
+                    "confidence": h["confidence"],
+                    "bbox": h["bbox"],
+                    "is_violation": False,
+                    "label_text": "HELMET WORN",
+                })
+            for v in person_vests:
+                detections.append({
+                    "class_name": "vest",
+                    "normalized_label": "vest",
+                    "confidence": v["confidence"],
+                    "bbox": v["bbox"],
+                    "is_violation": False,
+                    "label_text": "VEST WORN",
+                })
+
+        # Check helmets placed somewhere or in hand (NOT worn on any head)
+        for h_idx, h in enumerate(raw_helmets):
+            if h_idx not in used_helmets:
+                detections.append({
+                    "class_name": "helmet",
+                    "normalized_label": "helmet_not_worn",
+                    "confidence": h["confidence"],
+                    "bbox": h["bbox"],
+                    "is_violation": False,
+                    "label_text": "HELMET (NOT WORN)",
+                })
+
+    else:
+        # Fallback when no full person body is detected (close-up)
+        for nh in raw_no_helmets:
+            counts["no_helmet"] += 1
+            detections.append({
+                "class_name": "no_helmet",
+                "normalized_label": "no_helmet",
+                "violation_type": "helmet",
+                "confidence": nh["confidence"],
+                "bbox": nh["bbox"],
+                "is_violation": True,
+                "label_text": "HELMET NOT DETECTED",
+            })
+        for nv in raw_no_vests:
+            counts["no_vest"] += 1
+            detections.append({
+                "class_name": "no_vest",
+                "normalized_label": "no_vest",
+                "violation_type": "vest",
+                "confidence": nv["confidence"],
+                "bbox": nv["bbox"],
+                "is_violation": True,
+                "label_text": "SAFETY VEST MISSING",
+            })
+        for h in raw_helmets:
+            counts["helmet"] += 1
+            detections.append({
+                "class_name": "helmet",
+                "normalized_label": "helmet",
+                "confidence": h["confidence"],
+                "bbox": h["bbox"],
+                "is_violation": False,
+                "label_text": "HELMET",
+            })
+        for v in raw_vests:
+            counts["vest"] += 1
+            detections.append({
+                "class_name": "vest",
+                "normalized_label": "vest",
+                "confidence": v["confidence"],
+                "bbox": v["bbox"],
+                "is_violation": False,
+                "label_text": "VEST",
+            })
+
+    has_violation = any(d.get("is_violation") for d in detections)
 
     return {
+        "site_type": site_type,
         "weights_path": weights_path,
         "image": {"width": int(result.orig_shape[1]), "height": int(result.orig_shape[0])},
         "counts": counts,
-        "has_violation": counts["no_helmet"] > 0 or counts["no_vest"] > 0,
+        "has_violation": has_violation,
         "detections": detections,
     }, None
 
@@ -208,11 +456,16 @@ def health(): return jsonify({"ok":True,"service":"OctaVision API","time":now()}
 
 @app.get("/api/model/status")
 def model_status():
-    model, path, model_error = _get_model()
+    site_type = _resolve_site_type(request.args.get("site_type", "construction"))
+    if not site_type:
+        return err("site_type must be one of construction, chemical, road, mining, general.")
+
+    model, path, model_error = _get_model(site_type=site_type)
     if model_error:
-        return jsonify({"ready": False, "error": model_error}), 200
+        return jsonify({"ready": False, "site_type": site_type, "error": model_error}), 200
     return jsonify({
         "ready": model is not None,
+        "site_type": site_type,
         "weights_path": path,
         "supported_labels": ["helmet", "vest", "no_helmet", "no_vest"],
     })
@@ -234,12 +487,16 @@ def model_infer():
     except (ValueError, TypeError):
         return err("confidence and iou must be numbers.")
 
+    site_type = _resolve_site_type(payload.get("site_type", "construction"))
+    if not site_type:
+        return err("site_type must be one of construction, chemical, road, mining, general.")
+
     if not 0 <= conf <= 1:
         return err("confidence must be between 0 and 1.")
     if not 0 <= iou <= 1:
         return err("iou must be between 0 and 1.")
 
-    inference, infer_error = _run_inference(image, conf=conf, iou=iou)
+    inference, infer_error = _run_inference(image, site_type=site_type, conf=conf, iou=iou)
     if infer_error:
         return err(infer_error, 503)
 
@@ -316,43 +573,44 @@ def add_zone():
 
 @app.get("/api/violations")
 def violations():
-    status=request.args.get("status"); sid=request.args.get("site_id"); q=request.args.get("q","").strip()
-    where=[]; args=[]
-    if status in {"Open","Resolved"}: where.append("v.status=?"); args.append(status)
+    status = request.args.get("status")
+    sid = request.args.get("site_id")
+    q = request.args.get("q", "").strip()
+    site_int = None
     if sid:
-        try: where.append("v.site_id=?"); args.append(int(sid))
-        except ValueError: return err("Invalid site id.")
-    if q:
-        where.append("(s.name LIKE ? OR c.name LIKE ? OR z.name LIKE ? OR v.ppe_type LIKE ?)")
-        args += [f"%{q}%"]*4
-    sql="SELECT v.*,s.name site_name,c.name camera_name,z.name zone_name FROM violations v JOIN sites s ON s.id=v.site_id LEFT JOIN cameras c ON c.id=v.camera_id LEFT JOIN zones z ON z.id=v.zone_id"
-    if where: sql+=" WHERE "+" AND ".join(where)
-    sql+=" ORDER BY v.id DESC LIMIT 500"
-    with dbconn() as d: rows=d.execute(sql,args).fetchall()
-    return jsonify([obj(x) for x in rows])
+        try:
+            site_int = int(sid)
+        except ValueError:
+            return err("Invalid site id.")
+    violation_service.db_path = DB_PATH
+    rows = violation_service.get_violations(status=status, site_id=site_int, q=q)
+    return jsonify(rows)
 
 @app.patch("/api/violations/<int:vid>")
 def resolve_violation(vid):
-    x=request.get_json(silent=True) or {}; status=x.get("status")
-    if status not in {"Open","Resolved"}: return err("Status must be Open or Resolved.")
-    with dbconn() as d:
-        cur=d.execute("UPDATE violations SET status=? WHERE id=?",(status,vid))
-        if not cur.rowcount: return err("Violation not found.",404)
-        d.commit()
-        return jsonify(obj(d.execute("SELECT * FROM violations WHERE id=?",(vid,)).fetchone()))
+    x = request.get_json(silent=True) or {}
+    status = x.get("status")
+    if status not in {"Open", "Resolved"}:
+        return err("Status must be Open or Resolved.")
+    violation_service.db_path = DB_PATH
+    row = violation_service.resolve_violation(vid, status)
+    if not row:
+        return err("Violation not found.", 404)
+    return jsonify(row)
 
 @app.get("/api/alerts")
 def alerts():
-    with dbconn() as d: rows=d.execute("""SELECT a.*,v.site_id,v.camera_id,v.zone_id,v.ppe_type,v.snapshot_path,s.name site_name,c.name camera_name,z.name zone_name FROM alerts a JOIN violations v ON v.id=a.violation_id JOIN sites s ON s.id=v.site_id LEFT JOIN cameras c ON c.id=v.camera_id LEFT JOIN zones z ON z.id=v.zone_id ORDER BY a.id DESC LIMIT 200""").fetchall()
-    return jsonify([obj(x) for x in rows])
+    violation_service.db_path = DB_PATH
+    rows = violation_service.get_alerts()
+    return jsonify(rows)
 
 @app.post("/api/alerts/<int:aid>/acknowledge")
 def acknowledge(aid):
-    with dbconn() as d:
-        cur=d.execute("UPDATE alerts SET status='Acknowledged',acknowledged_at=? WHERE id=?",(now(),aid))
-        if not cur.rowcount: return err("Alert not found.",404)
-        d.commit()
-        return jsonify(obj(d.execute("SELECT * FROM alerts WHERE id=?",(aid,)).fetchone()))
+    violation_service.db_path = DB_PATH
+    row = violation_service.acknowledge_alert(aid)
+    if not row:
+        return err("Alert not found.", 404)
+    return jsonify(row)
 
 @app.post("/api/demo/simulate-violation")
 def simulate():
@@ -381,6 +639,59 @@ def simulate():
         d.commit()
         v=d.execute("SELECT * FROM violations WHERE id=?",(vid,)).fetchone(); a=d.execute("SELECT * FROM alerts WHERE id=?",(ac.lastrowid,)).fetchone()
     return jsonify({"violation":obj(v),"alert":obj(a),"simulated":True}),201
+
+
+@app.post("/api/violations/from-inference")
+def violation_from_inference():
+    """
+    Called by the frontend live loop when has_violation=true.
+    Accepts: site_id, camera_id, zone_id (opt), detections[], image_data (base64 JPEG).
+    Delegates to decoupled ViolationManagementService for duplicate suppression,
+    evidence snapshot capture and database persistence.
+    """
+    x = request.get_json(silent=True)
+    if not isinstance(x, dict):
+        return err("Send a JSON object.")
+
+    try:
+        sid = int(x.get("site_id"))
+        cid = int(x.get("camera_id"))
+    except (ValueError, TypeError):
+        return err("site_id and camera_id are required integers.")
+
+    zid = x.get("zone_id")
+    try:
+        zid = int(zid) if zid not in ("", None) else None
+    except (ValueError, TypeError):
+        zid = None
+
+    detections = x.get("detections", [])
+    image_data = str(x.get("image_data") or "").strip()
+
+    violation_service.db_path = DB_PATH
+    result = violation_service.process_frame_detections(
+        site_id=sid,
+        camera_id=cid,
+        detections=detections,
+        image_input=image_data,
+        zone_id=zid,
+    )
+
+    created_results = []
+    snapshot_path = ""
+    for r in result.get("created", []):
+        created_results.append({
+            "violation": r.get("violation"),
+            "alert": r.get("alert"),
+        })
+        if r.get("snapshot_path"):
+            snapshot_path = r.get("snapshot_path")
+
+    return jsonify({
+        "created": created_results,
+        "suppressed": result.get("suppressed", 0),
+        "snapshot_path": snapshot_path,
+    }), 201
 
 
 @app.post("/api/detections")
@@ -494,7 +805,23 @@ def ingest_detection():
     }), 201
 
 @app.get("/api/snapshots/<path:filename>")
-def snapshot(filename): return send_from_directory(SNAPS,filename)
+def snapshot(filename): return send_from_directory(SNAPS, filename)
+
+
+@app.get("/api/violations/<int:vid>")
+def violation_detail(vid):
+    violation_service.db_path = DB_PATH
+    row = violation_service.get_violation(vid)
+    if not row:
+        return err("Violation not found.", 404)
+    return jsonify(row)
+
+
+@app.get("/api/alerts/unread-count")
+def alerts_unread_count():
+    with dbconn() as d:
+        count = d.execute("SELECT COUNT(*) FROM alerts WHERE status='Active'").fetchone()[0]
+    return jsonify({"unread": count})
 
 @app.get("/api/reports/daily")
 def report():
@@ -517,4 +844,6 @@ def missing(_): return jsonify({"error":"Endpoint not found."}),404
 if __name__=="__main__":
     init_db()
     print(f"OctaVision API running; database: {DB_PATH}")
-    app.run(host="127.0.0.1",port=5000,debug=True)
+    import sys, os
+    port = int(sys.argv[1]) if len(sys.argv) > 1 and sys.argv[1].isdigit() else int(os.environ.get("PORT", 5000))
+    app.run(host="127.0.0.1", port=port, debug=True)

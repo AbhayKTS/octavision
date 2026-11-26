@@ -1,0 +1,17 @@
+# Chemical PPE dataset configuration
+# This YAML is a template for the final normalized dataset.
+# Actual images and labels are prepared in processed/images and processed/labels.
+
+train: processed/images/train
+val: processed/images/val
+test: processed/images/test
+
+nc: 7
+names:
+  0: person
+  1: gloves
+  2: goggles
+  3: face_shield
+  4: respirator
+  5: chemical_suit
+  6: protective_boots

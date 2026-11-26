@@ -25,6 +25,13 @@ CLASS_MAP = {
     "no_helmet": "no_helmet",
     "without_helmet": "no_helmet",
     "helmet_missing": "no_helmet",
+    "vest": "vest",
+    "safety_vest": "vest",
+    "with_vest": "vest",
+    "no_vest": "no_vest",
+    "without_vest": "no_vest",
+    "vest_missing": "no_vest",
+    "person": "person",
 }
 
 def main():

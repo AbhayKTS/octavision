@@ -95,6 +95,27 @@ python model_adapter\yolo_adapter.py --image "C:\path\to\test.jpg" --weights "C:
 
 Before running it, edit `backend\model_adapter\yolo_adapter.py` → `CLASS_MAP` to match the exact class names shown by your model. For example, if your dataset classes are `helmet` and `no-helmet`, add `"no-helmet": "no_helmet"` to the map. The adapter currently handles a single image, not webcam or RTSP streams.
 
+## Start chemical site model workflow
+You can now select model type from the frontend Live Monitoring page (`construction`, `chemical`, `road`, `mining`, `general`).
+
+For chemical PPE, prepare a YOLO dataset and train a separate model run (example):
+
+```powershell
+cd backend
+.\.venv\Scripts\Activate.ps1
+
+# Example only: replace with your chemical dataset YAML
+yolo detect train data="..\datasets\chemical-ppe\data.yaml" model="..\weights\yolo26n.pt" epochs=80 imgsz=640 project="..\runs\detect\runs\octavision" name="chemical_v1"
+```
+
+After training, set the chemical weights path in model registry (SQLite) to the generated `best.pt`:
+
+```powershell
+t:/octa/OctaVision/.venv/Scripts/python.exe -c "import sqlite3;db='t:/octa/OctaVision/backend/data/octavision.db';w='t:/octa/OctaVision/runs/detect/runs/octavision/chemical_v1/weights/best.pt';con=sqlite3.connect(db);cur=con.cursor();cur.execute('UPDATE model_registry SET version=?, status=?, weights_path=? WHERE site_type=?',('chemical_v1','Connected',w,'chemical'));con.commit();con.close();print('chemical model connected')"
+```
+
+Once saved, frontend image upload and live camera inference can run with `Site model = Chemical`.
+
 ## Existing dashboard workflow
 - Dashboard → **Simulate violation** still works.
 - Events are saved to SQLite and create alerts.

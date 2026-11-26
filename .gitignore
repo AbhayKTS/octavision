@@ -43,6 +43,10 @@ backend/data/snapshots/*
 
 # ML assets and training artifacts
 datasets/
+chemical_ppe_dataset/raw/
+chemical_ppe_dataset/images/
+chemical_ppe_dataset/labels/
+temp_sh17_repo/
 runs/
 weights/
 *.pt
