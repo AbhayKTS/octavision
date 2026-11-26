@@ -10,6 +10,7 @@ import cv2
 import numpy as np
 # Ultralytics is lazy-loaded on first inference request
 from violation_service import ViolationManagementService
+from site_profiles import SITE_PPE, supported, process_boxes
 
 ROOT = Path(__file__).resolve().parent
 DATA = ROOT / "data"
@@ -140,10 +141,7 @@ def _connected_weights(site_type):
         if configured and configured.is_file():
             return configured
 
-    candidates = SITE_MODEL_CANDIDATES.get(site_type, []) + [
-        ROOT.parent / "weights" / "yolo26n.pt",
-        ROOT.parent / "yolo26n.pt",
-    ]
+    candidates = [ROOT.parent / "weights" / f"{site_type}.pt"] + SITE_MODEL_CANDIDATES.get(site_type, [])
     for candidate in candidates:
         if candidate.is_file():
             return candidate
@@ -160,8 +158,11 @@ def _get_model(site_type="construction"):
         key = f"{site_type}|{resolved}"
         if key not in MODEL_RUNTIME["instances"]:
             MODEL_RUNTIME["instances"] = {k: v for k, v in MODEL_RUNTIME["instances"].items() if not k.startswith(f"{site_type}|")}
-            from ultralytics import YOLO
-            MODEL_RUNTIME["instances"][key] = YOLO(resolved)
+            try:
+                from ultralytics import YOLO
+                MODEL_RUNTIME["instances"] = {key: YOLO(resolved)}
+            except Exception as exc:
+                return None, resolved, f"Could not load {site_type} model: {exc}"
         model = MODEL_RUNTIME["instances"][key]
     return model, resolved, None
 
@@ -209,244 +210,15 @@ def _run_inference(image, site_type="construction", conf=0.35, iou=0.45):
     # Minimum threshold 0.32 to filter out noisy textures & spurious detections
     effective_conf = max(float(conf or 0.35), 0.32)
     result = model.predict(source=image, conf=effective_conf, iou=iou, verbose=False, max_det=60)[0]
-    boxes = result.boxes
-    names = result.names
-
-    raw_persons = []
-    raw_helmets = []
-    raw_vests = []
-    raw_no_helmets = []
-    raw_no_vests = []
-
-    # 1. Filter ONLY the core classes: person, helmet, vest
-    ALLOWED_LABELS = {"person", "helmet", "vest", "no_helmet", "no_vest"}
-    if boxes is not None:
-        for box in boxes:
-            x1, y1, x2, y2 = [int(v) for v in box.xyxy[0].tolist()]
-            class_id = int(box.cls.item())
-            raw_name = str(names[class_id])
-            normalized = _normalize_inference_label(raw_name)
-            score = float(box.conf.item())
-
-            if normalized not in ALLOWED_LABELS:
-                continue
-
-            item = {
-                "class_name": raw_name,
-                "normalized_label": normalized,
-                "confidence": round(score, 4),
-                "bbox": {"x1": x1, "y1": y1, "x2": x2, "y2": y2},
-            }
-
-            if normalized == "person":
-                raw_persons.append(item)
-            elif normalized == "helmet":
-                raw_helmets.append(item)
-            elif normalized == "vest":
-                raw_vests.append(item)
-            elif normalized == "no_helmet":
-                raw_no_helmets.append(item)
-            elif normalized == "no_vest":
-                raw_no_vests.append(item)
-
-    detections = []
-    counts = {"helmet": 0, "vest": 0, "no_helmet": 0, "no_vest": 0, "person": len(raw_persons), "full_ppe": 0}
-
-    def center(b):
-        return (b["x1"] + b["x2"]) / 2, (b["y1"] + b["y2"]) / 2
-
-    # 2. Person-Centric Wearing Association
-    if raw_persons:
-        used_helmets = set()
-        used_vests = set()
-
-        for idx, p in enumerate(raw_persons):
-            pb = p["bbox"]
-            pw = pb["x2"] - pb["x1"]
-            ph = pb["y2"] - pb["y1"]
-
-            # Head Region: top 38% of the person box
-            hx1, hx2 = pb["x1"] - 0.20 * pw, pb["x2"] + 0.20 * pw
-            hy1, hy2 = pb["y1"] - 0.25 * ph, pb["y1"] + 0.38 * ph
-
-            # Torso Region: 18% to 75% of the person's height
-            tx1, tx2 = pb["x1"] - 0.20 * pw, pb["x2"] + 0.20 * pw
-            ty1, ty2 = pb["y1"] + 0.18 * ph, pb["y1"] + 0.75 * ph
-
-            # Check for worn helmet on head
-            person_helmets = []
-            for h_idx, h in enumerate(raw_helmets):
-                cx, cy = center(h["bbox"])
-                if hx1 <= cx <= hx2 and hy1 <= cy <= hy2:
-                    person_helmets.append(h)
-                    used_helmets.add(h_idx)
-
-            has_helmet_worn = len(person_helmets) > 0
-
-            # Direct no_helmet box on head overrides
-            for nh in raw_no_helmets:
-                cx, cy = center(nh["bbox"])
-                if hx1 <= cx <= hx2 and hy1 <= cy <= hy2:
-                    has_helmet_worn = False
-                    break
-
-            # Check for worn vest on torso
-            person_vests = []
-            for v_idx, v in enumerate(raw_vests):
-                cx, cy = center(v["bbox"])
-                if tx1 <= cx <= tx2 and ty1 <= cy <= ty2:
-                    person_vests.append(v)
-                    used_vests.add(v_idx)
-
-            has_vest_worn = len(person_vests) > 0
-
-            # Direct no_vest box on torso overrides
-            for nv in raw_no_vests:
-                cx, cy = center(nv["bbox"])
-                if tx1 <= cx <= tx2 and ty1 <= cy <= ty2:
-                    has_vest_worn = False
-                    break
-
-            # Evaluate person compliance
-            p_conf = p["confidence"]
-            if not has_helmet_worn and not has_vest_worn:
-                # Both missing -> PPE Kit Violation
-                counts["no_helmet"] += 1
-                counts["no_vest"] += 1
-                counts["full_ppe"] += 1
-                detections.append({
-                    "class_name": "person",
-                    "normalized_label": "no_helmet_and_vest",
-                    "violation_type": "full_ppe",
-                    "confidence": p_conf,
-                    "bbox": pb,
-                    "is_violation": True,
-                    "label_text": "PPE KIT VIOLATION (NO HELMET + NO VEST)",
-                })
-            elif not has_helmet_worn and has_vest_worn:
-                # Has vest, but missing helmet -> Helmet Violation
-                counts["no_helmet"] += 1
-                counts["vest"] += 1
-                detections.append({
-                    "class_name": "person",
-                    "normalized_label": "no_helmet",
-                    "violation_type": "helmet",
-                    "confidence": p_conf,
-                    "bbox": pb,
-                    "is_violation": True,
-                    "label_text": "HELMET NOT DETECTED",
-                })
-            elif has_helmet_worn and not has_vest_worn:
-                # Has helmet, but missing vest -> Vest Violation
-                counts["no_vest"] += 1
-                counts["helmet"] += 1
-                detections.append({
-                    "class_name": "person",
-                    "normalized_label": "no_vest",
-                    "violation_type": "vest",
-                    "confidence": p_conf,
-                    "bbox": pb,
-                    "is_violation": True,
-                    "label_text": "SAFETY VEST MISSING",
-                })
-            else:
-                # Both worn -> Worker fully compliant
-                counts["helmet"] += 1
-                counts["vest"] += 1
-                detections.append({
-                    "class_name": "person",
-                    "normalized_label": "person",
-                    "confidence": p_conf,
-                    "bbox": pb,
-                    "is_violation": False,
-                    "label_text": "WORKER COMPLIANT",
-                })
-
-            # Add person's worn gear boxes
-            for h in person_helmets:
-                detections.append({
-                    "class_name": "helmet",
-                    "normalized_label": "helmet",
-                    "confidence": h["confidence"],
-                    "bbox": h["bbox"],
-                    "is_violation": False,
-                    "label_text": "HELMET WORN",
-                })
-            for v in person_vests:
-                detections.append({
-                    "class_name": "vest",
-                    "normalized_label": "vest",
-                    "confidence": v["confidence"],
-                    "bbox": v["bbox"],
-                    "is_violation": False,
-                    "label_text": "VEST WORN",
-                })
-
-        # Check helmets placed somewhere or in hand (NOT worn on any head)
-        for h_idx, h in enumerate(raw_helmets):
-            if h_idx not in used_helmets:
-                detections.append({
-                    "class_name": "helmet",
-                    "normalized_label": "helmet_not_worn",
-                    "confidence": h["confidence"],
-                    "bbox": h["bbox"],
-                    "is_violation": False,
-                    "label_text": "HELMET (NOT WORN)",
-                })
-
-    else:
-        # Fallback when no full person body is detected (close-up)
-        for nh in raw_no_helmets:
-            counts["no_helmet"] += 1
-            detections.append({
-                "class_name": "no_helmet",
-                "normalized_label": "no_helmet",
-                "violation_type": "helmet",
-                "confidence": nh["confidence"],
-                "bbox": nh["bbox"],
-                "is_violation": True,
-                "label_text": "HELMET NOT DETECTED",
-            })
-        for nv in raw_no_vests:
-            counts["no_vest"] += 1
-            detections.append({
-                "class_name": "no_vest",
-                "normalized_label": "no_vest",
-                "violation_type": "vest",
-                "confidence": nv["confidence"],
-                "bbox": nv["bbox"],
-                "is_violation": True,
-                "label_text": "SAFETY VEST MISSING",
-            })
-        for h in raw_helmets:
-            counts["helmet"] += 1
-            detections.append({
-                "class_name": "helmet",
-                "normalized_label": "helmet",
-                "confidence": h["confidence"],
-                "bbox": h["bbox"],
-                "is_violation": False,
-                "label_text": "HELMET",
-            })
-        for v in raw_vests:
-            counts["vest"] += 1
-            detections.append({
-                "class_name": "vest",
-                "normalized_label": "vest",
-                "confidence": v["confidence"],
-                "bbox": v["bbox"],
-                "is_violation": False,
-                "label_text": "VEST",
-            })
-
-    has_violation = any(d.get("is_violation") for d in detections)
-
+    counts, detections = process_boxes(result.boxes, result.names, site_type)
     return {
         "site_type": site_type,
         "weights_path": weights_path,
         "image": {"width": int(result.orig_shape[1]), "height": int(result.orig_shape[0])},
+        "required_ppe": list(SITE_PPE[site_type]),
+        "capabilities": supported(result.names, site_type),
         "counts": counts,
-        "has_violation": has_violation,
+        "has_violation": any(d["is_violation"] for d in detections),
         "detections": detections,
     }, None
 
@@ -467,7 +239,8 @@ def model_status():
         "ready": model is not None,
         "site_type": site_type,
         "weights_path": path,
-        "supported_labels": ["helmet", "vest", "no_helmet", "no_vest"],
+        "required_ppe": list(SITE_PPE[site_type]),
+        "capabilities": supported(model.names, site_type),
     })
 
 
@@ -496,7 +269,10 @@ def model_infer():
     if not 0 <= iou <= 1:
         return err("iou must be between 0 and 1.")
 
-    inference, infer_error = _run_inference(image, site_type=site_type, conf=conf, iou=iou)
+    try:
+        inference, infer_error = _run_inference(image, site_type=site_type, conf=conf, iou=iou)
+    except Exception as exc:
+        return err(f"Inference failed: {exc}", 503)
     if infer_error:
         return err(infer_error, 503)
 
@@ -846,4 +622,4 @@ if __name__=="__main__":
     print(f"OctaVision API running; database: {DB_PATH}")
     import sys, os
     port = int(sys.argv[1]) if len(sys.argv) > 1 and sys.argv[1].isdigit() else int(os.environ.get("PORT", 5000))
-    app.run(host="127.0.0.1", port=port, debug=True)
+    app.run(host=os.environ.get("OCTAVISION_HOST", "127.0.0.1"), port=port, debug=False)

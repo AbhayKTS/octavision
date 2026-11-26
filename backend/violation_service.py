@@ -244,7 +244,7 @@ class ViolationManagementService:
                     image_input=image_input,
                     detections=detections or [],
                     camera_name=cam_name,
-                    ppe_label="Helmet Not Detected" if ppe_normalized == "helmet" else "Safety Vest Missing",
+                    ppe_label=f"{ppe_normalized.replace(chr(95), chr(32)).title()} Missing",
                     confidence=confidence,
                     occurred_at=occurred_ts,
                 )
@@ -261,7 +261,7 @@ class ViolationManagementService:
         if is_critical:
             alert_message = f"Critical PPE Alert: Helmet Not Detected ({cam_name}) · Conf: {confidence:.0%}"
         else:
-            alert_message = f"PPE Warning: Safety Vest Missing ({cam_name}) · Conf: {confidence:.0%}"
+            alert_message = f"PPE Warning: {ppe_normalized.replace(chr(95), chr(32)).title()} Missing ({cam_name}) · Conf: {confidence:.0%}"
 
         with self._dbconn() as d:
             cur = d.execute(
@@ -330,7 +330,7 @@ class ViolationManagementService:
         ppe_types_present = {}
         for det in violation_dets:
             lbl = det.get("normalized_label", "")
-            ppe = "helmet" if lbl == "no_helmet" else "vest" if lbl == "no_vest" else None
+            ppe = lbl[3:] if lbl.startswith("no_") else None
             if ppe:
                 if ppe not in ppe_types_present or det.get("confidence", 0) > ppe_types_present[ppe].get("confidence", 0):
                     ppe_types_present[ppe] = det

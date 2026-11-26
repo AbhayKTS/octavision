@@ -1,3 +1,7 @@
+# Raspberry Pi and site-specific detection update
+
+See [PI_SETUP.md](PI_SETUP.md) for the current setup, model requirements, site-specific behavior and limitations. Some earlier starter notes below are historical.
+
 # OctaVision Local Starter — Milestone 2
 
 React + Flask + SQLite dashboard with simulated events plus a model-independent detection ingestion API and an optional YOLO adapter scaffold.

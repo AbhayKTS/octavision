@@ -142,7 +142,7 @@ function PpeTile({ label, value, tone, Icon }) {
       <div className="ppe-tile-dot" />
       <div className="ppe-tile-icon"><Icon size={16} /></div>
       <div className="ppe-tile-label">{label}</div>
-      <div className="ppe-tile-count">{value || 0}</div>
+      <div className="ppe-tile-count">{value ?? '—'}</div>
     </div>
   );
 }
@@ -190,8 +190,8 @@ export default function ModelInferencePanel({
   zones = [],
   onViolationDetected,
 }) {
-  const [siteType, setSiteType] = useState('construction');
   const [selectedSiteId, setSelectedSiteId] = useState('');
+  const siteType = sites.find((site) => String(site.id) === String(selectedSiteId))?.site_type || 'construction';
   const [selectedCamId, setSelectedCamId] = useState('');
 
   const [modelStatus, setModelStatus] = useState(null);
@@ -234,8 +234,8 @@ export default function ModelInferencePanel({
       if (!selectedCamId || !siteCams.some((c) => String(c.id) === String(selectedCamId))) {
         setSelectedCamId(String(siteCams[0].id));
       }
-    } else if (cams.length > 0) {
-      setSelectedCamId(String(cams[0].id));
+    } else {
+      setSelectedCamId('');
     }
   }, [cams, selectedSiteId, selectedCamId]);
 
@@ -350,7 +350,7 @@ export default function ModelInferencePanel({
   /* ── send violation event to backend ── */
   async function reportViolation(detections, imageData) {
     const sId = selectedSiteId || (sites[0]?.id ? String(sites[0].id) : null);
-    const cId = selectedCamId || (cams[0]?.id ? String(cams[0].id) : null);
+    const cId = selectedCamId || null;
     if (!sId || !cId) return;
 
     try {
@@ -446,20 +446,14 @@ export default function ModelInferencePanel({
         <div className="panel-title">
           <div>
             <h2>Static image PPE analysis</h2>
-            <p>Upload a still frame to detect Person, Helmet, Vest, and missing PPE boxes.</p>
+            <p>Detect PPE classes supported by the selected site model. An unseen item is not automatically a violation.</p>
           </div>
         </div>
 
         <div className="model-actions">
           <label className="field model-site-field">
             <span>Site model</span>
-            <select value={siteType} onChange={(e) => setSiteType(e.target.value)}>
-              <option value="construction">Construction Site Model</option>
-              <option value="chemical">Chemical Factory Model</option>
-              <option value="road">Road Construction Model</option>
-              <option value="mining">Mining & Quarry Model</option>
-              <option value="general">General Industrial Model</option>
-            </select>
+            <strong>{siteType} (from selected site)</strong>
           </label>
         </div>
 
@@ -467,7 +461,8 @@ export default function ModelInferencePanel({
           <span className={modelStatus?.ready ? 'status-ok' : 'status-bad'}>
             {modelStatus?.ready ? 'Model connected' : 'Model not ready'}
           </span>
-          <small>{modelStatus?.weights_path || statusError || 'No weights configured yet.'}</small>
+          <small>{modelStatus?.error || modelStatus?.weights_path || statusError || 'No weights configured yet.'}</small>
+          {modelStatus?.capabilities && <small>Model classes: {Object.entries(modelStatus.capabilities).map(([ppe, support]) => `${ppe}: ${support.present ? 'present' : 'not supported'} / ${support.missing ? 'missing supported' : 'missing not supported'}`).join(' · ')}</small>}
         </div>
 
         <div
@@ -537,10 +532,12 @@ export default function ModelInferencePanel({
 
         <div className="ppe-tile-grid">
           <PpeTile label="Persons" value={uploadCounts.person} tone="info" Icon={PersonIcon} />
-          <PpeTile label="Helmet" value={uploadCounts.helmet} tone="ok" Icon={HardHatIcon} />
-          <PpeTile label="Vest" value={uploadCounts.vest} tone="info" Icon={VestIcon} />
-          <PpeTile label="No Helmet" value={uploadCounts.no_helmet} tone="bad" Icon={NoHelmetIcon} />
-          <PpeTile label="No Vest" value={uploadCounts.no_vest} tone="warn" Icon={NoVestIcon} />
+          {(modelStatus?.required_ppe || []).map((ppe) => (
+            <div key={ppe}>
+              <PpeTile label={ppe.replaceAll('_', ' ')} value={modelStatus?.capabilities?.[ppe]?.present ? uploadCounts[ppe] : '—'} tone="ok" Icon={HardHatIcon} />
+              <PpeTile label={`No ${ppe.replaceAll('_', ' ')}`} value={modelStatus?.capabilities?.[ppe]?.missing ? uploadCounts[`no_${ppe}`] : '—'} tone="bad" Icon={NoHelmetIcon} />
+            </div>
+          ))}
         </div>
       </section>
 
@@ -557,7 +554,7 @@ export default function ModelInferencePanel({
         <div className="form-grid" style={{ marginBottom: 12 }}>
           <label className="field">
             <span>Worksite</span>
-            <select value={selectedSiteId} onChange={(e) => setSelectedSiteId(e.target.value)}>
+            <select disabled={liveRunning} value={selectedSiteId} onChange={(e) => setSelectedSiteId(e.target.value)}>
               {sites.map((s) => (
                 <option key={s.id} value={s.id}>
                   {s.name}
@@ -567,7 +564,7 @@ export default function ModelInferencePanel({
           </label>
           <label className="field">
             <span>Camera source</span>
-            <select value={selectedCamId} onChange={(e) => setSelectedCamId(e.target.value)}>
+            <select disabled={liveRunning} value={selectedCamId} onChange={(e) => setSelectedCamId(e.target.value)}>
               {(activeSiteCams.length > 0 ? activeSiteCams : cams).map((c) => (
                 <option key={c.id} value={c.id}>
                   {c.name}
@@ -611,10 +608,12 @@ export default function ModelInferencePanel({
 
         <div className="ppe-tile-grid">
           <PpeTile label="Persons" value={liveCounts.person} tone="info" Icon={PersonIcon} />
-          <PpeTile label="Helmet" value={liveCounts.helmet} tone="ok" Icon={HardHatIcon} />
-          <PpeTile label="Vest" value={liveCounts.vest} tone="info" Icon={VestIcon} />
-          <PpeTile label="No Helmet" value={liveCounts.no_helmet} tone="bad" Icon={NoHelmetIcon} />
-          <PpeTile label="No Vest" value={liveCounts.no_vest} tone="warn" Icon={NoVestIcon} />
+          {(modelStatus?.required_ppe || []).map((ppe) => (
+            <div key={ppe}>
+              <PpeTile label={ppe.replaceAll('_', ' ')} value={modelStatus?.capabilities?.[ppe]?.present ? liveCounts[ppe] : '—'} tone="ok" Icon={HardHatIcon} />
+              <PpeTile label={`No ${ppe.replaceAll('_', ' ')}`} value={modelStatus?.capabilities?.[ppe]?.missing ? liveCounts[`no_${ppe}`] : '—'} tone="bad" Icon={NoHelmetIcon} />
+            </div>
+          ))}
         </div>
       </section>
     </div>
