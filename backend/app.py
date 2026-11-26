@@ -151,7 +151,7 @@ def _connected_weights(site_type):
 def _get_model(site_type="construction"):
     weights_path = _connected_weights(site_type)
     if not weights_path:
-        return None, None, f"No model weights found for site_type='{site_type}'. Configure registry weights first."
+        return None, None, f"No model weights found for site_type='{site_type}'. Run python tools/install_ppe_model.py from the project root for general, construction and road. Chemical/mining require separate trained weights."
 
     resolved = str(weights_path.resolve())
     with MODEL_RUNTIME["lock"]:

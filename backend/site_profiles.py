@@ -21,6 +21,7 @@ ALIASES = {
     'without_helmet': 'no_helmet', 'helmet_missing': 'no_helmet',
     'without_vest': 'no_vest', 'vest_missing': 'no_vest',
     'no_glove': 'no_gloves', 'without_gloves': 'no_gloves',
+    'no_boots': 'no_protective_boots',
 }
 
 def normalize(label):

@@ -23,6 +23,11 @@ class SiteProfileTests(unittest.TestCase):
         _, detections = process_boxes([Box(0)], {0: 'person'}, 'construction')
         self.assertFalse(detections[0]['is_violation'])
 
+    def test_public_model_class_aliases(self):
+        caps = supported({0: 'Hard_hat', 1: 'No-Helmet', 2: 'Glove', 3: 'No-Glove', 4: 'Vest', 5: 'No-Vest', 6: 'Worker'}, 'road')
+        for item in ('helmet', 'vest', 'gloves'):
+            self.assertEqual(caps[item], {'present': True, 'missing': True})
+
     def test_positive_only_model_does_not_claim_missing_support(self):
         capabilities = supported({0: 'person', 1: 'gloves'}, 'chemical')
         self.assertTrue(capabilities['gloves']['present'])
