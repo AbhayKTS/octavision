@@ -1,16 +1,22 @@
-from flask import Flask, jsonify, request, send_from_directory
+from flask import Flask, jsonify, request, send_from_directory, Response
 from flask_cors import CORS
 from pathlib import Path
 from datetime import datetime, date
 import base64
+import logging
 import threading
 import sqlite3, uuid
+import math
 
 import cv2
 import numpy as np
 # Ultralytics is lazy-loaded on first inference request
 from violation_service import ViolationManagementService
 from site_profiles import SITE_PPE, supported, process_boxes
+from pi_config import get_pi_config, check_pi_status, PI_STREAM_URL
+from pi_camera_worker import PiCameraWorker
+
+logger = logging.getLogger("octavision.api")
 
 ROOT = Path(__file__).resolve().parent
 DATA = ROOT / "data"
@@ -52,6 +58,17 @@ def init_db():
             d.execute("INSERT INTO zones(site_id,camera_id,name,required_ppe,created_at) VALUES(?,?,?,?,?)",(sid,cid,"Main Hazard Zone","helmet",t))
             for name,typ in [("General Model","general"),("Construction Site Model","construction"),("Road Construction Model","road"),("Chemical Factory Model","chemical"),("Mining & Quarry Model","mining")]:
                 d.execute("INSERT INTO model_registry(name,site_type,version,status) VALUES(?,?,?,?)",(name,typ,"not-connected","Planned"))
+
+        # Auto-register Raspberry Pi 5 hardware relay camera if not present
+        rpi_cam = d.execute("SELECT id FROM cameras WHERE source_type='rpi'").fetchone()
+        if not rpi_cam:
+            first_site = d.execute("SELECT id FROM sites ORDER BY id ASC LIMIT 1").fetchone()
+            if first_site:
+                t = now()
+                d.execute(
+                    "INSERT INTO cameras(site_id,name,source_type,source_url,status,created_at) VALUES(?,?,?,?,?,?)",
+                    (first_site[0], "Raspberry Pi 5 — Live Video Relay", "rpi", PI_STREAM_URL, "Active", t)
+                )
         d.commit()
 
 def obj(r): return dict(r) if r else None
@@ -167,6 +184,17 @@ def _get_model(site_type="construction"):
     return model, resolved, None
 
 
+def _is_rpi_camera(cid):
+    if not cid:
+        return False
+    try:
+        with dbconn() as d:
+            row = d.execute("SELECT source_type FROM cameras WHERE id=?", (int(cid),)).fetchone()
+            return bool(row and row["source_type"] == "rpi")
+    except Exception:
+        return False
+
+
 def _decode_image_from_request():
     if "file" in request.files:
         uploaded = request.files["file"]
@@ -180,9 +208,23 @@ def _decode_image_from_request():
         return image, None
 
     payload = request.get_json(silent=True) or {}
+    if request.form:
+        payload = request.form.to_dict()
+
+    source = str(payload.get("source") or "").strip().lower()
+    cid = payload.get("camera_id")
+
+    # If stream source is Raspberry Pi 5
+    if source in {"rpi", "pi", "raspberry_pi"} or (cid and _is_rpi_camera(cid)):
+        worker = PiCameraWorker.get_instance()
+        success, frame, _ = worker.get_latest_frame()
+        if not success or frame is None:
+            return None, "Raspberry Pi stream is currently offline or unreachable."
+        return frame, None
+
     image_data = str(payload.get("image_data") or "").strip()
     if not image_data:
-        return None, "Send multipart file or JSON image_data (base64 data URL)."
+        return None, "Send multipart file, base64 image_data, or source='rpi'."
 
     try:
         base64_part = image_data.split(",", 1)[1] if "," in image_data else image_data
@@ -202,13 +244,13 @@ def _normalize_inference_label(raw_label):
     return INFERENCE_LABEL_MAP.get(key, key)
 
 
-def _run_inference(image, site_type="construction", conf=0.35, iou=0.45):
+def _run_inference(image, site_type="construction", conf=0.25, iou=0.45):
     model, weights_path, model_error = _get_model(site_type=site_type)
     if model_error:
         return None, model_error
 
-    # Minimum threshold 0.32 to filter out noisy textures & spurious detections
-    effective_conf = max(float(conf or 0.35), 0.32)
+    # Dynamic threshold: reject noise < 0.22 while ensuring workers in profile are detected
+    effective_conf = max(float(conf or 0.25), 0.22)
     result = model.predict(source=image, conf=effective_conf, iou=iou, verbose=False, max_det=60)[0]
     counts, detections = process_boxes(result.boxes, result.names, site_type)
     return {
@@ -276,7 +318,25 @@ def model_infer():
     if infer_error:
         return err(infer_error, 503)
 
-    return jsonify({"ok": True, **inference})
+    # Automatic violation recording & forensic evidence capture if camera_id provided
+    recorded_violations = []
+    cid = payload.get("camera_id")
+    if cid and inference.get("has_violation"):
+        try:
+            with dbconn() as d:
+                cam = d.execute("SELECT * FROM cameras WHERE id=?", (int(cid),)).fetchone()
+            if cam:
+                res = violation_service.process_frame_detections(
+                    site_id=cam["site_id"],
+                    camera_id=cam["id"],
+                    detections=inference.get("detections", []),
+                    image_input=image,
+                )
+                recorded_violations = res.get("created", [])
+        except Exception as exc:
+            logger.warning(f"Error processing inference violations: {exc}")
+
+    return jsonify({"ok": True, **inference, "recorded_violations": recorded_violations})
 
 @app.get("/api/dashboard")
 def dashboard():
@@ -316,14 +376,62 @@ def add_camera():
     x=request.get_json(silent=True) or {}
     try: sid=int(x.get("site_id"))
     except (ValueError,TypeError): return err("Choose a site.")
-    name=str(x.get("name","")).strip(); typ=str(x.get("source_type","simulated")); url=str(x.get("source_url","")).strip()
+    name=str(x.get("name","")).strip(); typ=str(x.get("source_type","simulated")).lower(); url=str(x.get("source_url","")).strip()
     if not name: return err("Camera name is required.")
-    if typ not in {"simulated","webcam","rtsp"}: return err("Invalid source type.")
+    if typ not in {"simulated","webcam","rtsp","rpi"}: return err("Invalid source type. Expected simulated, webcam, rtsp, or rpi.")
     if typ=="rtsp" and not url: return err("RTSP URL is required.")
+    if typ=="rpi" and not url: url=PI_STREAM_URL
     with dbconn() as d:
         if not d.execute("SELECT id FROM sites WHERE id=?",(sid,)).fetchone(): return err("Site not found.")
-        cur=d.execute("INSERT INTO cameras(site_id,name,source_type,source_url,status,created_at) VALUES(?,?,?,?,?,?)",(sid,name,typ,url,"Demo" if typ=="simulated" else "Configured",now())); d.commit()
+        status = "Active" if typ in {"webcam", "rpi"} else ("Demo" if typ=="simulated" else "Configured")
+        cur=d.execute("INSERT INTO cameras(site_id,name,source_type,source_url,status,created_at) VALUES(?,?,?,?,?,?)",(sid,name,typ,url,status,now())); d.commit()
         return jsonify(obj(d.execute("SELECT c.*,s.name site_name FROM cameras c JOIN sites s ON s.id=c.site_id WHERE c.id=?",(cur.lastrowid,)).fetchone())),201
+
+
+@app.get("/api/cameras/pi-config")
+def camera_pi_config():
+    """Return centralized Raspberry Pi configuration."""
+    return jsonify({"ok": True, "config": get_pi_config()})
+
+
+@app.get("/api/cameras/pi-status")
+def camera_pi_status():
+    """Return real-time stream status and Pi hardware health."""
+    worker = PiCameraWorker.get_instance()
+    worker_stat = worker.get_status()
+    hw_stat = check_pi_status(timeout=1.5)
+    return jsonify({
+        "ok": True,
+        "online": worker_stat["online"] or hw_stat["online"],
+        "worker": worker_stat,
+        "hardware": hw_stat,
+    })
+
+
+@app.get("/api/cameras/pi-stream")
+def camera_pi_stream():
+    """Proxy live MJPEG stream from Raspberry Pi 5 to clients."""
+    worker = PiCameraWorker.get_instance()
+    return Response(
+        worker.generate_mjpeg_stream(),
+        mimetype="multipart/x-mixed-replace; boundary=frame"
+    )
+
+
+@app.get("/api/cameras/<int:cid>/stream")
+def camera_stream_by_id(cid):
+    """Generic stream endpoint by camera ID."""
+    with dbconn() as d:
+        cam = d.execute("SELECT * FROM cameras WHERE id=?", (cid,)).fetchone()
+    if not cam:
+        return err("Camera not found.", 404)
+    if cam["source_type"] == "rpi":
+        worker = PiCameraWorker.get_instance()
+        return Response(
+            worker.generate_mjpeg_stream(),
+            mimetype="multipart/x-mixed-replace; boundary=frame"
+        )
+    return err("Streaming only available for Raspberry Pi / MJPEG sources.", 400)
 
 @app.get("/api/zones")
 def zones():
@@ -439,9 +547,34 @@ def violation_from_inference():
     try:
         zid = int(zid) if zid not in ("", None) else None
     except (ValueError, TypeError):
-        zid = None
+        return err("zone_id must be an integer.")
 
     detections = x.get("detections", [])
+    if not isinstance(detections, list) or len(detections) > 100:
+        return err("detections must be a list of at most 100 objects.")
+    with dbconn() as d:
+        site = d.execute("SELECT site_type FROM sites WHERE id=?", (sid,)).fetchone()
+        if not site:
+            return err("Site not found.", 404)
+        if not d.execute("SELECT id FROM cameras WHERE id=? AND site_id=?", (cid, sid)).fetchone():
+            return err("Camera must belong to selected site.")
+        if zid and not d.execute("SELECT id FROM zones WHERE id=? AND site_id=? AND (camera_id IS NULL OR camera_id=?)", (zid, sid, cid)).fetchone():
+            return err("Zone must belong to selected site and camera.")
+        allowed = SITE_PPE.get(site["site_type"], ())
+    for detection in detections:
+        if not isinstance(detection, dict):
+            return err("Each detection must be an object.")
+        try:
+            confidence = float(detection.get("confidence"))
+        except (ValueError, TypeError):
+            return err("Detection confidence must be a number between 0 and 1.")
+        if not math.isfinite(confidence) or not 0 <= confidence <= 1:
+            return err("Detection confidence must be a number between 0 and 1.")
+        label = detection.get("normalized_label")
+        if not isinstance(label, str):
+            return err("Detection normalized_label must be a string.")
+        if detection.get("is_violation") and (not label.startswith("no_") or label[3:] not in allowed):
+            return err("Violation class is not supported by the selected site.")
     image_data = str(x.get("image_data") or "").strip()
 
     violation_service.db_path = DB_PATH
@@ -622,4 +755,4 @@ if __name__=="__main__":
     print(f"OctaVision API running; database: {DB_PATH}")
     import sys, os
     port = int(sys.argv[1]) if len(sys.argv) > 1 and sys.argv[1].isdigit() else int(os.environ.get("PORT", 5000))
-    app.run(host=os.environ.get("OCTAVISION_HOST", "127.0.0.1"), port=port, debug=False)
+    app.run(host=os.environ.get("OCTAVISION_HOST", "127.0.0.1"), port=port, debug=False, threaded=True)

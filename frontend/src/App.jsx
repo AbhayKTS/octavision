@@ -143,7 +143,7 @@ export default function App() {
   const [zoneForm, setZoneForm] = useState({ site_id: '', camera_id: '', name: '', required_ppe: 'helmet' });
   const [form, setForm] = useState('');
 
-  const lastAlertId = useRef(0);
+  const lastAlertId = useRef(null);
   const soundRef = useRef(true);
 
   useEffect(() => {
@@ -167,15 +167,13 @@ export default function App() {
       if (!zoneForm.site_id && s.length) setZoneForm((f) => ({ ...f, site_id: String(s[0].id) }));
 
       // Sound notification for new alert
-      if (a.length && lastAlertId.current && a[0].id > lastAlertId.current) {
+      if (a.length && lastAlertId.current !== null && a[0].id > lastAlertId.current) {
         setToast(a[0].message);
         if (soundRef.current) {
           playSafetyAlarm();
         }
       }
-      if (a.length) {
-        lastAlertId.current = Math.max(lastAlertId.current, a[0].id);
-      }
+      lastAlertId.current = Math.max(lastAlertId.current ?? 0, a[0]?.id ?? 0);
       setError('');
     } catch (e) {
       setError(`Backend connection failed: ${e.message}. Start Flask in the backend.`);
@@ -590,7 +588,6 @@ export default function App() {
                 zones={zones}
                 onViolationDetected={(v) => {
                   refresh();
-                  if (soundRef.current) playSafetyAlarm();
                   setToast(`Live violation captured: ${v.ppe_type.toUpperCase()} missing on ${v.camera_name || 'Camera'}`);
                 }}
               />
@@ -837,11 +834,21 @@ export default function App() {
                         value={camForm.source_type}
                         onChange={(e) => setCamForm({ ...camForm, source_type: e.target.value })}
                       >
-                        <option value="simulated">Simulated</option>
-                        <option value="webcam">Webcam (Live)</option>
+                        <option value="simulated">Simulated Demo</option>
+                        <option value="rpi">Raspberry Pi 5 (Live Video Relay)</option>
+                        <option value="webcam">Webcam (Browser Direct)</option>
                         <option value="rtsp">RTSP CCTV</option>
                       </select>
                     </Field>
+                    {camForm.source_type === 'rpi' && (
+                      <Field label="Pi Stream URL (leave empty for default relay)">
+                        <input
+                          value={camForm.source_url}
+                          onChange={(e) => setCamForm({ ...camForm, source_url: e.target.value })}
+                          placeholder="http://172.20.10.7:8001/video_feed"
+                        />
+                      </Field>
+                    )}
                     {camForm.source_type === 'rtsp' && (
                       <Field label="RTSP URL">
                         <input
@@ -891,7 +898,12 @@ export default function App() {
                       .map((c) => (
                         <div className="camera-row" key={c.id}>
                           <Video size={15} />
-                          <span>{c.name}</span>
+                          <span style={{ flex: 1, minWidth: 0 }}>{c.name}</span>
+                          {c.source_type === 'rpi' && (
+                            <span style={{ fontSize: 10, background: '#e0f2fe', color: '#0369a1', padding: '2px 7px', borderRadius: 6, fontWeight: 700 }}>
+                              Raspberry Pi 5
+                            </span>
+                          )}
                           <Pill value={c.status} />
                         </div>
                       ))}

@@ -3,8 +3,14 @@ import React, { useEffect, useMemo, useRef, useState } from 'react';
 const BOX_COLORS = {
   helmet: '#36b37e',
   vest: '#2f80ed',
+  gloves: '#10b981',
+  boots: '#8b5cf6',
+  goggles: '#06b6d4',
   no_helmet: '#eb5757',
   no_vest: '#f2994a',
+  no_gloves: '#ec4899',
+  no_boots: '#f43f5e',
+  no_goggle: '#e11d48',
   person: '#38bdf8',
 };
 
@@ -20,26 +26,33 @@ function drawOverlay(canvas, detections, imageSize) {
   if (!imageSize?.width || !imageSize?.height) return;
   const sx = width / imageSize.width;
   const sy = height / imageSize.height;
-  ctx.lineWidth = 2;
-  ctx.font = '12px Inter, DM Sans, sans-serif';
+
+  const scale = Math.max(1, width / 800);
+  ctx.lineWidth = Math.max(2, Math.round(2 * scale));
+  const fontSize = Math.max(11, Math.round(12 * scale));
+  ctx.font = `bold ${fontSize}px Inter, DM Sans, sans-serif`;
 
   detections.forEach((det) => {
     const { x1, y1, x2, y2 } = det.bbox;
     const color = boxColor(det.normalized_label);
-    const px = x1 * sx, py = y1 * sy;
+    const px = x1 * sx;
+    const py = y1 * sy;
     const pw = Math.max((x2 - x1) * sx, 2);
     const ph = Math.max((y2 - y1) * sy, 2);
-    const title = `${det.normalized_label.replace('_', ' ')} ${(det.confidence * 100).toFixed(1)}%`;
+    const labelText = (det.normalized_label || det.class_name || '').replace('_', ' ');
+    const title = `${labelText} ${(det.confidence * 100).toFixed(1)}%`;
 
     ctx.strokeStyle = color;
     ctx.strokeRect(px, py, pw, ph);
 
-    const textWidth = ctx.measureText(title).width + 10;
-    const textY = py > 22 ? py - 22 : py + 4;
+    const textWidth = ctx.measureText(title).width + 8;
+    const badgeHeight = fontSize + 6;
+    const textY = py > badgeHeight + 2 ? py - badgeHeight : py + 2;
+
     ctx.fillStyle = color;
-    ctx.fillRect(px, textY, textWidth, 18);
+    ctx.fillRect(px, textY, textWidth, badgeHeight);
     ctx.fillStyle = '#ffffff';
-    ctx.fillText(title, px + 5, textY + 13);
+    ctx.fillText(title, px + 4, textY + fontSize - 1);
   });
 }
 
@@ -148,14 +161,19 @@ function PpeTile({ label, value, tone, Icon }) {
 }
 
 /* ── Radar Placeholder ──────────────────────────────────────────── */
-function RadarPlaceholder() {
+function RadarPlaceholder({ isRpi, piOnline }) {
   return (
     <div className="radar-placeholder">
       <div className="radar-rings">
         <div className="radar-ring" /><div className="radar-ring" /><div className="radar-ring" />
-        <div className="radar-icon"><CameraOffIcon size={18} /></div>
+        <div className="radar-icon"><CamIcon size={20} /></div>
       </div>
-      <p><strong>Camera is offline.</strong><br />Press &ldquo;Start camera&rdquo; to begin stream.</p>
+      <p>
+        <strong>{isRpi ? 'Raspberry Pi 5 Relay Stream' : 'Camera is offline.'}</strong><br />
+        {isRpi
+          ? (piOnline ? 'Physical Pi 5 relay online (172.20.10.7:8001). Press "Start camera" to view feed.' : 'Connecting to Raspberry Pi 5 (172.20.10.7:8001)...')
+          : 'Press "Start camera" to begin stream.'}
+      </p>
     </div>
   );
 }
@@ -216,10 +234,47 @@ export default function ModelInferencePanel({
 
   const fileInputRef = useRef(null);
   const videoRef = useRef(null);
+  const rpiImgRef = useRef(null);
   const overlayRef = useRef(null);
   const captureRef = useRef(null);
   const streamRef = useRef(null);
   const loopRef = useRef(false);
+
+  // Raspberry Pi status
+  const [piStatus, setPiStatus] = useState({ online: false, fps: 0, resolution: null });
+  const activeSiteCams = cams.filter((c) => String(c.site_id) === String(selectedSiteId));
+  const activeCam = cams.find((c) => String(c.id) === String(selectedCamId));
+  const isRpi = activeCam?.source_type === 'rpi';
+
+  // Poll Pi status when an RPi camera is selected
+  useEffect(() => {
+    let alive = true;
+    if (!isRpi) return;
+
+    function checkStatus() {
+      fetch(`${apiBase}/cameras/pi-status`)
+        .then((r) => r.json())
+        .then((data) => {
+          if (alive && data.ok) {
+            setPiStatus({
+              online: Boolean(data.online),
+              fps: data.worker?.fps || 0,
+              resolution: data.worker?.resolution || null,
+            });
+          }
+        })
+        .catch(() => {
+          if (alive) setPiStatus((prev) => ({ ...prev, online: false }));
+        });
+    }
+
+    checkStatus();
+    const interval = setInterval(checkStatus, 4000);
+    return () => {
+      alive = false;
+      clearInterval(interval);
+    };
+  }, [apiBase, isRpi, selectedCamId]);
 
   // Sync selected site and camera from props
   useEffect(() => {
@@ -238,6 +293,15 @@ export default function ModelInferencePanel({
       setSelectedCamId('');
     }
   }, [cams, selectedSiteId, selectedCamId]);
+
+  // Automatically reset stream if camera changes
+  const prevCamIdRef = useRef(selectedCamId);
+  useEffect(() => {
+    if (prevCamIdRef.current && prevCamIdRef.current !== selectedCamId) {
+      stopCamera();
+    }
+    prevCamIdRef.current = selectedCamId;
+  }, [selectedCamId]);
 
   /* fetch model status */
   useEffect(() => {
@@ -259,13 +323,12 @@ export default function ModelInferencePanel({
     };
   }, [apiBase, siteType]);
 
-  useEffect(() => {
-    return () => {
-      if (previewUrl) URL.revokeObjectURL(previewUrl);
-      stopCamera();
-      if (bannerTimerRef.current) clearTimeout(bannerTimerRef.current);
-    };
-  }, [previewUrl]);
+  useEffect(() => () => { if (previewUrl) URL.revokeObjectURL(previewUrl); }, [previewUrl]);
+  useEffect(() => () => {
+    loopRef.current = false;
+    if (streamRef.current) streamRef.current.getTracks().forEach((track) => track.stop());
+    if (bannerTimerRef.current) clearTimeout(bannerTimerRef.current);
+  }, []);
 
   const uploadCounts = useMemo(() => uploadResult?.counts || {}, [uploadResult]);
   const liveCounts = useMemo(() => liveResult?.counts || {}, [liveResult]);
@@ -306,7 +369,7 @@ export default function ModelInferencePanel({
       const formData = new FormData();
       formData.append('file', selectedFile);
       formData.append('site_type', siteType);
-      formData.append('confidence', '0.2');
+      formData.append('confidence', '0.25');
       formData.append('iou', '0.45');
       const response = await fetch(`${apiBase}/model/infer`, { method: 'POST', body: formData });
       const data = await response.json();
@@ -321,6 +384,13 @@ export default function ModelInferencePanel({
 
   /* ── camera stream controls ── */
   async function startCamera() {
+    if (isRpi) {
+      // Connect to Raspberry Pi 5 MJPEG relay stream - no browser webcam access needed
+      setLiveEnabled(true);
+      setLiveError('');
+      return;
+    }
+
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
       streamRef.current = stream;
@@ -351,7 +421,7 @@ export default function ModelInferencePanel({
   async function reportViolation(detections, imageData) {
     const sId = selectedSiteId || (sites[0]?.id ? String(sites[0].id) : null);
     const cId = selectedCamId || null;
-    if (!sId || !cId) return;
+    if (!sId || !cId) throw new Error('Select a site and a camera belonging to it before starting detection.');
 
     try {
       const response = await fetch(`${apiBase}/violations/from-inference`, {
@@ -365,6 +435,7 @@ export default function ModelInferencePanel({
         }),
       });
       const data = await response.json();
+      if (!response.ok) throw new Error(data.error || `HTTP ${response.status}`);
       if (data.created && data.created.length > 0) {
         const v = data.created[0].violation;
         showViolation(v);
@@ -372,42 +443,84 @@ export default function ModelInferencePanel({
           onViolationDetected(v);
         }
       }
-    } catch (_) {
-      // Best-effort reporting
+    } catch (err) {
+      throw new Error(`Could not save violation: ${err.message}`);
     }
   }
 
   /* ── live frame inference loop ── */
   async function inferLiveFrame() {
-    const video = videoRef.current;
-    const capture = captureRef.current;
     const overlay = overlayRef.current;
-    if (!video || !capture || !overlay || video.videoWidth === 0 || video.videoHeight === 0) return;
+    if (!overlay) return;
 
     setLiveBusy(true);
     try {
-      capture.width = video.videoWidth;
-      capture.height = video.videoHeight;
-      capture.getContext('2d').drawImage(video, 0, 0, capture.width, capture.height);
-      const imageData = capture.toDataURL('image/jpeg', 0.75);
+      let data;
+      if (isRpi) {
+        // Stream directly from Raspberry Pi 5 - backend processes latest frame with zero lag
+        const response = await fetch(`${apiBase}/model/infer`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            source: 'rpi',
+            camera_id: Number(selectedCamId),
+            site_type: siteType,
+            confidence: 0.25,
+            iou: 0.45,
+          }),
+        });
+        data = await response.json();
+        if (!response.ok) throw new Error(data.error || `HTTP ${response.status}`);
 
-      const response = await fetch(`${apiBase}/model/infer`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ image_data: imageData, site_type: siteType, confidence: 0.2, iou: 0.45 }),
-      });
-      const data = await response.json();
-      if (!response.ok) throw new Error(data.error || `HTTP ${response.status}`);
+        const imgWidth = data.image?.width || 640;
+        const imgHeight = data.image?.height || 480;
+        overlay.width = imgWidth;
+        overlay.height = imgHeight;
+        drawOverlay(overlay, data.detections || [], data.image || { width: imgWidth, height: imgHeight });
+      } else {
+        // Local webcam capture
+        const video = videoRef.current;
+        const capture = captureRef.current;
+        if (!video || !capture || video.videoWidth === 0 || video.videoHeight === 0) return;
 
-      overlay.width = video.videoWidth;
-      overlay.height = video.videoHeight;
-      drawOverlay(overlay, data.detections || [], data.image || { width: video.videoWidth, height: video.videoHeight });
+        capture.width = video.videoWidth;
+        capture.height = video.videoHeight;
+        capture.getContext('2d').drawImage(video, 0, 0, capture.width, capture.height);
+        const imageData = capture.toDataURL('image/jpeg', 0.75);
+
+        const response = await fetch(`${apiBase}/model/infer`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            image_data: imageData,
+            camera_id: Number(selectedCamId) || null,
+            site_type: siteType,
+            confidence: 0.25,
+            iou: 0.45,
+          }),
+        });
+        data = await response.json();
+        if (!response.ok) throw new Error(data.error || `HTTP ${response.status}`);
+
+        overlay.width = video.videoWidth;
+        overlay.height = video.videoHeight;
+        drawOverlay(overlay, data.detections || [], data.image || { width: video.videoWidth, height: video.videoHeight });
+
+        if (data.has_violation && data.detections && (!data.recorded_violations || data.recorded_violations.length === 0)) {
+          await reportViolation(data.detections, imageData);
+        }
+      }
+
       setLiveResult(data);
       setLiveError('');
 
-      // If violation found, send to backend for evidence capture & duplicate suppression
-      if (data.has_violation && data.detections) {
-        reportViolation(data.detections, imageData);
+      // If violation was recorded by backend, display banner and trigger alert sound
+      if (data.recorded_violations && data.recorded_violations.length > 0) {
+        const v = data.recorded_violations[0].violation;
+        if (v) {
+          showViolation(v);
+          if (onViolationDetected) onViolationDetected(v);
+        }
       }
     } catch (err) {
       setLiveError(err.message || 'Live detection failed.');
@@ -427,6 +540,7 @@ export default function ModelInferencePanel({
 
   function startLiveDetection() {
     if (!liveEnabled) return;
+    if (!selectedSiteId || !selectedCamId) { setLiveError('Select a site and its camera before starting detection.'); return; }
     loopRef.current = true;
     setLiveRunning(true);
     runLoop();
@@ -436,8 +550,6 @@ export default function ModelInferencePanel({
     loopRef.current = false;
     setLiveRunning(false);
   }
-
-  const activeSiteCams = cams.filter((c) => String(c.site_id) === String(selectedSiteId));
 
   return (
     <div className="model-grid">
@@ -504,29 +616,39 @@ export default function ModelInferencePanel({
         {uploadError && <div className="model-error">{uploadError}</div>}
 
         {previewUrl && (
-          <div className="upload-preview-wrap">
-            <img src={previewUrl} alt="Upload preview" className="upload-preview" />
-            {uploadResult?.detections?.map((det, idx) => {
-              const w = uploadResult?.image?.width || 1;
-              const h = uploadResult?.image?.height || 1;
-              return (
-                <div
-                  key={`${det.class_name}-${idx}`}
-                  className="upload-box"
-                  style={{
-                    left: `${(det.bbox.x1 / w) * 100}%`,
-                    top: `${(det.bbox.y1 / h) * 100}%`,
-                    width: `${((det.bbox.x2 - det.bbox.x1) / w) * 100}%`,
-                    height: `${((det.bbox.y2 - det.bbox.y1) / h) * 100}%`,
-                    borderColor: boxColor(det.normalized_label),
-                  }}
-                >
-                  <span style={{ background: boxColor(det.normalized_label) }}>
-                    {det.normalized_label.replace('_', ' ')} {(det.confidence * 100).toFixed(1)}%
-                  </span>
-                </div>
-              );
-            })}
+          <div className="upload-stage">
+            <div className="upload-media-wrap">
+              <img src={previewUrl} alt="Upload preview" className="upload-preview" />
+              {uploadResult?.detections?.map((det, idx) => {
+                const w = uploadResult?.image?.width || 1;
+                const h = uploadResult?.image?.height || 1;
+                const topPct = (det.bbox.y1 / h) * 100;
+                const isNearTop = topPct < 7;
+                const label = (det.normalized_label || det.class_name || '').replace('_', ' ');
+                return (
+                  <div
+                    key={`${det.class_name}-${idx}`}
+                    className="upload-box"
+                    style={{
+                      left: `${(det.bbox.x1 / w) * 100}%`,
+                      top: `${topPct}%`,
+                      width: `${((det.bbox.x2 - det.bbox.x1) / w) * 100}%`,
+                      height: `${((det.bbox.y2 - det.bbox.y1) / h) * 100}%`,
+                      borderColor: boxColor(det.normalized_label),
+                    }}
+                  >
+                    <span
+                      style={{
+                        background: boxColor(det.normalized_label),
+                        top: isNearTop ? '2px' : '-22px',
+                      }}
+                    >
+                      {label} {(det.confidence * 100).toFixed(1)}%
+                    </span>
+                  </div>
+                );
+              })}
+            </div>
           </div>
         )}
 
@@ -565,23 +687,37 @@ export default function ModelInferencePanel({
           <label className="field">
             <span>Camera source</span>
             <select disabled={liveRunning} value={selectedCamId} onChange={(e) => setSelectedCamId(e.target.value)}>
-              {(activeSiteCams.length > 0 ? activeSiteCams : cams).map((c) => (
+              {activeSiteCams.map((c) => (
                 <option key={c.id} value={c.id}>
-                  {c.name}
+                  {c.name} {c.source_type === 'rpi' ? '— (Raspberry Pi 5)' : ''}
                 </option>
               ))}
             </select>
           </label>
         </div>
 
+        {/* Raspberry Pi Hardware Status Bar */}
+        {isRpi && (
+          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '7px 12px', background: '#f8fafc', border: '1px solid #e2e8f0', borderRadius: 8, marginBottom: 14, fontSize: 11 }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 7 }}>
+              <span style={{ width: 8, height: 8, borderRadius: '50%', background: piStatus.online ? '#10b981' : '#f59e0b', display: 'inline-block' }} />
+              <b style={{ color: '#1e293b' }}>Hardware Source:</b>
+              <span style={{ color: piStatus.online ? '#059669' : '#d97706', fontWeight: 700 }}>
+                {piStatus.online ? `Raspberry Pi 5 Relay Online · ${piStatus.fps || '25+'} FPS` : 'Raspberry Pi 5 Connecting…'}
+              </span>
+            </div>
+            <small style={{ color: '#64748b' }}>{activeCam?.source_url || 'http://172.20.10.7:8001/video_feed'}</small>
+          </div>
+        )}
+
         <div className="model-actions">
           {!liveEnabled ? (
             <button className="btn primary" onClick={startCamera}>
-              <CamIcon size={14} /> Start camera
+              <CamIcon size={14} /> {isRpi ? 'Start Pi 5 stream' : 'Start camera'}
             </button>
           ) : (
             <button className="btn secondary" onClick={stopCamera}>
-              Stop camera
+              {isRpi ? 'Stop Pi 5 stream' : 'Stop camera'}
             </button>
           )}
           {liveEnabled && !liveRunning && (
@@ -599,9 +735,26 @@ export default function ModelInferencePanel({
         {liveError && <div className="model-error">{liveError}</div>}
 
         <div className="live-stage">
-          <video ref={videoRef} autoPlay muted playsInline className="live-video" />
-          <canvas ref={overlayRef} className="live-overlay" />
-          {!liveEnabled && <RadarPlaceholder />}
+          <div className="live-media-wrap" style={{ display: liveEnabled ? 'inline-block' : 'none' }}>
+            {isRpi ? (
+              <img
+                ref={rpiImgRef}
+                src={liveEnabled ? `${apiBase}/cameras/pi-stream` : ''}
+                alt="Raspberry Pi 5 Live Stream"
+                className="live-video"
+                onLoad={(e) => {
+                  if (overlayRef.current) {
+                    overlayRef.current.width = e.target.naturalWidth || 640;
+                    overlayRef.current.height = e.target.naturalHeight || 480;
+                  }
+                }}
+              />
+            ) : (
+              <video ref={videoRef} autoPlay muted playsInline className="live-video" />
+            )}
+            <canvas ref={overlayRef} className="live-overlay" />
+          </div>
+          {!liveEnabled && <RadarPlaceholder isRpi={isRpi} piOnline={piStatus.online} />}
           {liveViolation && <ViolationBanner violation={liveViolation} onClose={() => setLiveViolation(null)} />}
         </div>
         <canvas ref={captureRef} className="hidden-capture" />

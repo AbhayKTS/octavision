@@ -22,18 +22,29 @@ OCTAVISION_HOST=0.0.0.0 python app.py
 
 Find the Pi's address with `hostname -I`. Keep both devices on a trusted private network. The development API has no authentication and must not be exposed to the internet. It stores frames used as alert evidence locally. Setup and performance must be checked on the actual Pi. A Pi 5 needs adequate cooling and a working boot setup.
 
-## Laptop: dashboard and camera
+## Confirmed Working Hardware Integration (Verified)
 
-Install Node.js, clone this same repository, then in PowerShell:
+### Network & Streaming Architecture
+- **Raspberry Pi 5**: `172.20.10.7` (hostname: `abhay.local`, user: `abhay`, Debian 13 Trixie ARM64)
+- **Laptop Host**: `172.20.10.5`
+- **Laptop Camera Source Server**: `http://172.20.10.5:8085/video_feed`
+- **Raspberry Pi 5 Relay Stream**: `http://172.20.10.7:8001/video_feed`
+- **Raspberry Pi 5 Status Endpoint**: `http://172.20.10.7:8001/`
 
-```powershell
-cd octavision/frontend
-npm ci
-$env:VITE_API_BASE="http://PI_IP_ADDRESS:5000"
-npm run dev
-```
+### Video Pipeline
+1. Inbuilt Webcam -> Laptop Camera Server (`8085`)
+2. Laptop Camera Server -> Raspberry Pi 5 (`/home/abhay/octavision-camera`)
+3. Raspberry Pi 5 -> MJPEG Video Relay (`8001`)
+4. OctaVision Backend -> Centralized `PiCameraWorker` (`backend/pi_camera_worker.py`) consuming `http://172.20.10.7:8001/video_feed` with auto-reconnection and single-frame buffer.
+5. Live Stream Proxy & AI Model -> Backend feeds decoded Pi 5 frames directly to YOLO detection models with zero browser webcam conflict.
+6. Evidence & Alert Dispatch -> Real-time deduplicated violation recording (20s cooldown), watermarked forensic evidence snapshots (`backend/data/snapshots/`), and dashboard alert notifications.
 
-Open the localhost URL printed by Vite **on the laptop**. Browser camera access works on localhost; opening an ordinary HTTP page hosted at the Pi's LAN address may be blocked as an insecure context. In Configuration create a site with the desired type and add a camera to that site. In Live Monitoring select the site and camera, allow browser camera access, then start detection. Laptop captures frames; Pi runs the selected model and stores alerts. Both computers must have network connectivity and the Pi firewall must permit the chosen port on the trusted LAN.
+### Centralized Configuration
+Configured in `backend/pi_config.py`. Override defaults using environment variables:
+- `OCTAVISION_PI_HOST` (default: `172.20.10.7`)
+- `OCTAVISION_PI_PORT` (default: `8001`)
+- `OCTAVISION_LAPTOP_HOST` (default: `172.20.10.5`)
+- `OCTAVISION_LAPTOP_CAM_PORT` (default: `8085`)
 
 ## Training
 

@@ -62,6 +62,20 @@ class ViolationServiceTests(unittest.TestCase):
         self.assertEqual(len(data2["created"]), 0)
         self.assertEqual(data2["suppressed"], 2)
 
+    def test_invalid_site_camera_and_zone_are_rejected(self):
+        base = {"site_id": self.site_id, "camera_id": self.camera_id, "detections": []}
+        for values in ({"site_id": 999999}, {"camera_id": 999999}, {"zone_id": "bad"}, {"zone_id": 999999}):
+            response = self.client.post("/api/violations/from-inference", json={**base, **values})
+            self.assertIn(response.status_code, (400, 404))
+        self.assertEqual(self.client.get("/api/violations").get_json(), [])
+
+    def test_invalid_detections_and_wrong_site_ppe_are_rejected(self):
+        base = {"site_id": self.site_id, "camera_id": self.camera_id}
+        for detections in ("bad", [None], [{"normalized_label": "no_helmet", "confidence": float("nan"), "is_violation": True}], [{"normalized_label": "no_chemical_suit", "confidence": .9, "is_violation": True}]):
+            response = self.client.post("/api/violations/from-inference", json={**base, "detections": detections})
+            self.assertEqual(response.status_code, 400)
+        self.assertEqual(self.client.get("/api/violations").get_json(), [])
+
     def test_violation_resolution_lifecycle(self):
         payload = {
             "site_id": self.site_id,
